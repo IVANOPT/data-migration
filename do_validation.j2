@@ -1,0 +1,170 @@
+#!/bin/bash
+# Pay attention to the dir accuracy.
+
+# TODO Extract table list to external files.
+# Checks if file has size greater than 0
+# Pay attention to the dir accuracy.
+
+# Absolute path to this script, e.g. /home/user/bin/foo.sh
+SCRIPT=$(readlink -f "$0")
+# Absolute path this script is in, thus /home/user/bin
+# TODO: extract UAT/Pre-PRD schema names.
+EXEC_DIR=$(dirname "$SCRIPT")
+echo "EXEC_DIR: $EXEC_DIR"
+
+BASEDIR=$(dirname $(dirname $(dirname "$EXEC_DIR")))
+echo "Base Data Migration Dir: $BASEDIR"
+
+FULL_MIGRATION_DIR=${BASEDIR}/{{ migration_type }}
+CHILD_SCHEMA_DIR=${FULL_MIGRATION_DIR}/{{ data_split_tag }}
+
+AGG_VALIDATOR_DIR={{ agg_validator_dir }}
+# cat ${CHILD_SCHEMA_DIR}/*source.info | sort | uniq > ${CHILD_SCHEMA_DIR}/overall.info
+input="${CHILD_SCHEMA_DIR}/overall.info"
+
+if [ ! $# -eq 1 ]
+  then
+    echo "Arguments supplied not accurate: [env]"
+    exit 1
+else
+  env=$1
+  echo "env: ${env}"
+fi
+
+function get_mirror_schema_path_by_env {
+  local l_env=$1
+  local l_tbl_name=$2
+  declare -A l_schema_path_dict
+  l_schema_path_dict['bak']='{{ bak_schema_path }}/{{ bak_table_prefix }}'${l_tbl_name}''
+  l_schema_path_dict['pre-prd']='{{ pre_prd_schema_path }}/{{ pre_prd_table_prefix }}'${l_tbl_name}''
+  l_schema_path_dict['uat']='{{ uat_schema_path }}/{{ uat_table_prefix }}'${l_tbl_name}''
+  echo ${l_schema_path_dict["$l_env"]}
+}
+
+function get_table_prefix_by_env {
+  local l_env=$1
+  declare -A l_table_prefix_dict
+  l_table_prefix_dict['bak']='{{ bak_table_prefix }}'
+  l_table_prefix_dict['pre-prd']='{{ pre_prd_table_prefix }}'
+  l_table_prefix_dict['uat']='{{ uat_table_prefix }}'
+  echo ${l_table_prefix_dict["$l_env"]}
+}
+
+function get_target_schema_by_env {
+  local l_env=$1
+  declare -A l_target_schema_dict
+  l_target_schema_dict['bak']='{{ bak_schema_name }}'
+  l_target_schema_dict['pre-prd']='{{ pre_prd_schema_name }}'
+  l_target_schema_dict['uat']='{{ uat_schema_name }}'
+  echo ${l_target_schema_dict["$l_env"]}
+}
+
+function get_schema_path {
+  local l_tbl_name=$1
+  echo '{{ prd_schema_path }}/'${l_tbl_name}''
+}
+
+# $1: table path on hdfs.
+function get_volume_command {
+  local l_tbl_hdfs_path=$1
+  echo "hdfs dfs -du -s ${l_tbl_hdfs_path}"
+}
+
+# $1: table path on hdfs.
+function get_latest_etl_time {
+  local l_tbl_hdfs_path=$1
+  echo `hadoop fs -ls ${l_tbl_hdfs_path} | awk -F" " '{print $6" "$7" "$8}' | sort -nr | head -1 | cut -d" " -f1,2`
+}
+
+# $1: un-known type data.
+function get_data_in_number_type {
+  local l_unknow_type_data=$1
+  if [[ ! $l_unknow_type_data =~ ^(\.[0-9]+|[0-9]+(\.[0-9]*)?)$ ]]; then
+    l_unknow_type_data=0
+  fi
+  echo ${l_unknow_type_data}
+}
+
+# $1: un-known type data.
+function is_number_type {
+  local l_unknow_type_data=$1
+  local is_number=true
+  if [[ ! $l_unknow_type_data =~ ^(\.[0-9]+|[0-9]+(\.[0-9]*)?)$ ]]; then
+    is_number=false
+  fi
+  echo ${is_number}
+}
+
+cp /dev/null ${EXEC_DIR}/validator_$(date -I).result
+kinit -kt /home/serv-cdp-prd/serv-cdp-prd.keytab serv-cdp-prd
+while IFS= read -r line
+do
+  result_pass=false
+  volume_diff=0
+  hive_staging_volume_diff=0
+
+  tbl_name=${line}
+  mirror_tbl_path=$(get_mirror_schema_path_by_env ${env} ${tbl_name})
+  echo "mirror_tbl_path: $mirror_tbl_path"
+  mirror_volume_command_exe=$(get_volume_command ${mirror_tbl_path})
+  echo "mirror_volume_command_exe: $mirror_volume_command_exe"
+  mirror_tbl_volume=`eval $mirror_volume_command_exe | awk -F' ' '{print $1}'`
+
+  tbl_path=$(get_schema_path ${tbl_name})
+  echo "tbl_path: $tbl_path"
+  volume_command_exe=$(get_volume_command ${tbl_path})
+  echo "volume_command_exe: $volume_command_exe"
+  tbl_volume=`eval $volume_command_exe | awk -F' ' '{print $1}'`
+
+  cp ${BASEDIR}/auto_data_recovery_by_partition_based_prd.sh ${EXEC_DIR}/
+  cp ${BASEDIR}/auto_data_recovery_by_partition_based_mirror.sh ${EXEC_DIR}/
+
+  # Protection of volume diff calculation.
+  tbl_volume_in_number=$(is_number_type ${tbl_volume})
+  mirror_tbl_volume_in_number=$(is_number_type ${mirror_tbl_volume})
+  if [[ ${tbl_volume_in_number} == false ]] || [[ ${mirror_tbl_volume_in_number} == false ]]; then
+    echo "The data storage is being written while reading from."
+    result_pass=pending
+  else
+    volume_diff=$(($tbl_volume-$mirror_tbl_volume))
+    if [[ $volume_diff == 0 ]]; then
+      result_pass=true
+    else
+      # Take temp files into account generated from spark-sql/hive-sql/hue etc.
+      echo "Take temp files into account to eliminate error rate."
+      mirror_hive_staging_tbl_path=${mirror_tbl_path}/.hive-staging*
+      mirror_hive_staging_volume_command_exe=$(get_volume_command ${mirror_hive_staging_tbl_path})
+      mirror_hive_staging_volume=`eval $mirror_hive_staging_volume_command_exe | awk -F' ' '{sum+=$1} END {print sum}'`
+      mirror_hive_staging_volume_dealed=$(get_data_in_number_type ${mirror_hive_staging_volume})
+
+      hive_staging_tbl_path=${tbl_path}/.hive-staging*
+      hive_staging_volume_command_exe=$(get_volume_command ${hive_staging_tbl_path})
+      hive_staging_volume=`eval $hive_staging_volume_command_exe | awk -F' ' '{sum+=$1} END {print sum}'`
+      hive_staging_volume_dealed=$(get_data_in_number_type ${hive_staging_volume})
+
+      hive_staging_volume_diff=$(($hive_staging_volume_dealed - $mirror_hive_staging_volume_dealed))
+
+      if [[ $volume_diff == $hive_staging_volume_diff ]]; then
+        result_pass=true
+        echo "The volume diff in that hive staging history records which won't influence data usage."
+      # Data replenishment for full type data migration.
+      elif [[ {{ migration_type }} == 'inc_migrate'  ]]; then
+        echo "Start data replenishment as recovery ..."
+        command_exe_1="sh ${EXEC_DIR}/auto_data_recovery_by_partition_based_prd.sh {{ schema_name }} ${tbl_name} $(get_target_schema_by_env ${env}) $(get_table_prefix_by_env ${env})${tbl_name} > ${EXEC_DIR}/data_recovery.log"
+        echo ${command_exe_1}
+        eval ${command_exe_1}
+        command_exe_2="sh ${EXEC_DIR}/auto_data_recovery_by_partition_based_mirror.sh {{ schema_name }} ${tbl_name} $(get_target_schema_by_env ${env}) $(get_table_prefix_by_env ${env})${tbl_name} > ${EXEC_DIR}/data_recovery.log"
+        echo ${command_exe_2}
+        eval ${command_exe_2}
+        result_pass=recovered
+      fi
+    fi
+  fi
+
+  prd_latest_etl_time=$(get_latest_etl_time ${tbl_path})
+  mirror_latest_etl_time=$(get_latest_etl_time ${mirror_tbl_path})
+  validate_time=`date +"%F %T"`
+
+  echo "{{ schema_name }}, ${tbl_name}, ${env}, ${mirror_tbl_volume}, prd, ${tbl_volume}, overall_diff, ${volume_diff}, hive_staging_diff, ${hive_staging_volume_diff}, prd_latest_etl_time, ${prd_latest_etl_time}, ${env}_latest_etl_time, ${mirror_latest_etl_time}, validate_time, ${validate_time}, ${result_pass}" >> ${EXEC_DIR}/validator_$(date -I).result
+
+done < "$input"

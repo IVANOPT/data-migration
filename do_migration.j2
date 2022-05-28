@@ -1,0 +1,44 @@
+#!/bin/bash
+# Pay attention to the dir accuracy.
+
+# Absolute path to this script, e.g. /home/user/bin/foo.sh
+SCRIPT=$(readlink -f "$0")
+# Absolute path this script is in, thus /home/user/bin
+EXEC_DIR=$(dirname "$SCRIPT")
+echo "EXEC_DIR: $EXEC_DIR"
+
+BASEDIR=$(dirname $(dirname $(dirname "$EXEC_DIR")))
+echo "Base Data Migration Dir: $BASEDIR"
+
+FULL_MIGRATION_DIR=${BASEDIR}/{{ migration_type }}
+CHILD_SCHEMA_DIR=${FULL_MIGRATION_DIR}/{{ data_split_tag }}
+
+# TODO: Prepare data to be migrated in advance. 1. Collect overall table list first. 2. Split tables to children dirs.
+# cat ${CHILD_SCHEMA_DIR}/*source.info | sort | uniq > ${CHILD_SCHEMA_DIR}/overall.info
+input="${CHILD_SCHEMA_DIR}/overall.info"
+
+# $1: wait time [5:00]
+if [[ $# -eq 1 ]]
+then
+  WAIT_TIME=$(( $(date -f - +%s- <<< "today $1"$'\nnow') 0 ))
+  if [[ ${WAIT_TIME} -gt 0 ]]; then
+    echo "The task will wait ${WAIT_TIME} seconds to be executed."
+    sleep ${WAIT_TIME}
+  else
+    echo "The wait time has passed, it would be executed immediately."
+  fi
+fi
+
+kinit -kt /home/serv-cdp-prd/serv-cdp-prd.keytab serv-cdp-prd
+while IFS= read -r line
+do
+  tbl_name=${line}
+  tbl_path=${EXEC_DIR}/${tbl_name}
+  echo "Table Path: ${tbl_path}"
+  echo "Background Testing..."
+  mkdir -p "${tbl_path}"
+  cp ${BASEDIR}/data_migration.sh ${tbl_path}
+  command_exe="${tbl_path}/data_migration.sh {{ schema_name }} {{ source_table_prefix }}${tbl_name} {{ target_schema_name }} {{ target_table_prefix }}${tbl_name} {{ migration_type }} > ${tbl_path}/bak_migration.log"
+  echo $command_exe
+  eval $command_exe
+done < "$input"

@@ -1,0 +1,186 @@
+#!/bin/bash
+
+#  declare src_path=$1
+#  declare dest_path=$2
+#  
+#  # Allow snapshot on source and destination
+#  hdfs dfsadmin -allowSnapshot src_path
+#  hdfs dfsadmin -allowSnapshot dest_path
+#  
+#  # Create snapshot for both source and destination
+#  hdfs -createSnapshot src_path snap1
+#  hdfs -createSnapshot dest_path snap2
+#  
+#  # Execute distcp sync
+#  hadoop distcp -update -diff snap1 snap2 src_path dest_path
+
+EXEC_DIR=$(dirname $0)
+
+if [ ! $# -eq 5 ]
+  then
+    echo "Arguments supplied not accurate: [source_db_name, source_table_name, target_db_name, target_table_name, migration_type]"
+    exit 1
+else
+  source_db_name=$1
+  source_table_name=$2
+  target_db_name=$3
+  target_table_name=$4
+  # TODO: Auto realize if the scenario is full or inc data migration.
+  migration_type=$5
+  echo "source db name: ${source_db_name}"
+  echo "source table name: ${source_table_name}"
+  echo "target db name: ${target_db_name}"
+  echo "target table name: ${target_table_name}"
+  echo "migration type: ${migration_type}"
+fi
+
+#mr_job_queue_name='root.cdp.adhoc-ph-rsc'
+mr_job_queue_name='root.cdp.uat-1'
+partition_list=''
+latest_sync_date=''
+
+# $1: db_name, $2: table_name, $3: table_desc
+function retrieve_table_location {
+  # Retrieve source table location.
+  hive -e "show create table $1.$2" > ${EXEC_DIR}/"$3"_table_ddl.info
+  # The last grep 'hdfs' used to clean up other location lines which used as value recording.
+  table_location=`cat "${EXEC_DIR}"/"$3"_table_ddl.info | grep '\bhdfsw*\b' | awk -F "'" '{print $2}' | grep 'hdfs'`
+  echo ${table_location}
+}
+
+# Retrieve source table location.
+source_table_location=$(retrieve_table_location ${source_db_name} ${source_table_name} 'source')
+echo "source_table_location: ${source_table_location}"
+# Retrieve target table location.
+target_table_location=$(retrieve_table_location ${target_db_name} ${target_table_name} 'target')
+echo "target_table_location: ${target_table_location}"
+
+
+# $1: table_location
+function record_table_volume {
+  #tbl_volume=`hdfs dfs -du -h -s "$1" | awk '{print $1 $2}'`
+  tbl_volume=`hdfs dfs -du -s "$1" | awk '{print $1}'`
+  echo "${tbl_volume}"
+}
+
+# $1: source table location, $2: target table location.
+function distributed_data_copy {
+  hadoop distcp -Dmapreduce.job.queuename=${mr_job_queue_name} -m 50 -strategy dynamic $1/* $2
+  hdfs dfs -chmod -R 777 $2
+}
+
+# $1: source table location, $2: target table location.
+function distributed_data_copy_and_overwrite {
+  # hadoop distcp -overwrite -Dmapreduce.job.queuename=${mr_job_queue_name} -update -delete $1/* $2
+  hadoop distcp -Dmapreduce.job.queuename=${mr_job_queue_name} -m 50 -strategy dynamic -update -delete $1 $2
+  hdfs dfs -chmod -R 777 $2
+}
+
+global_latest_sync_date=''
+
+function get_latest_sync_date {
+  # echo | cat ${EXEC_DIR}/sync_date
+  echo | cat /tmp/sync_date
+}
+
+function record_sync_date {
+  local l_date="$(date +'%Y-%m-%d %T')"
+  echo $l_date > ${EXEC_DIR}/sync_date
+}
+
+# $1: source db name, $2: source table name.
+function get_partition_list {
+  hive -e "show partitions $1.$2" > ${EXEC_DIR}/partitions.info
+  partition_list="${EXEC_DIR}/partitions.info"
+}
+
+# $1: source table location, $2: last data sync date.
+function get_partition_list_by_date {
+  local l_source_table_location=$1
+  local l_last_sync_date=$2
+  echo "l_source_table_location: $l_source_table_location"
+  echo "l_last_sync_date: $l_last_sync_date"
+  hdfs dfs -ls $l_source_table_location | awk -v inner_sync_date=$l_last_sync_date  -F' ' '{if($6>=inner_sync_date){print $8}}'| awk -F'/' '{print $NF}' > ${EXEC_DIR}/partitions.info
+  partition_list="${EXEC_DIR}/partitions.info"
+}
+
+global_latest_sync_date=$(get_latest_sync_date)
+echo "Latest sync date: $global_latest_sync_date"
+
+function do_full_data_migration {
+  echo "Do full data migration."
+  echo "Remove data from target location in that the same file from diff partitions"
+  hdfs dfs -rm -r -skipTrash ${target_table_location}/*
+  local_source_volume=$(record_table_volume "${source_table_location}")
+  echo "source: '${source_table_location}', volume: '${local_source_volume}'"
+  distributed_data_copy ${source_table_location} ${target_table_location}
+  local_target_volume=$(record_table_volume "${target_table_location}")
+  echo "target: '${target_table_location}', volume: '${local_target_volume}'"
+  record_sync_date
+}
+
+function do_repair_partition {
+  hive -e "msck repair table ${target_db_name}.${target_table_name}"
+}
+
+if [[ $migration_type == 'full_migrate' ]]
+then
+  do_full_data_migration
+  do_repair_partition
+elif [[ -z $global_latest_sync_date ]]
+then
+  echo "For first sync scenario."
+  do_full_data_migration
+  do_repair_partition
+elif [[ $migration_type == 'inc_migrate' ]]
+then
+  echo "Partition required while migration."
+  # Retrieve source table's partitions.
+  # get_partition_list ${source_db_name} ${source_table_name}
+  get_partition_list_by_date ${source_table_location} $global_latest_sync_date
+  i=1
+  while IFS= read -r line
+  do
+
+    # This is Non-Partition signal - 'FAILED'.
+    # FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask. Table test_yzz is not a partitioned table
+    # This is Partition ending signal - 'WARN'.
+    # WARN: Please see http://www.slf4j.org/codes.html#release for an explanation.
+    if [[ ! $line == WARN:* ]]
+    then
+      partition=$line
+      source_table_partition_location="${source_table_location}/${partition}"
+      local_source_volume=$(record_table_volume "${source_table_partition_location}")
+      echo "source: '${source_table_partition_location}', volume: '${local_source_volume}'"
+      # Mismatch of metadata and data.
+      if [ -z "${local_source_volume}" ]
+      then
+        continue
+      fi
+
+      target_table_partition_location="${target_table_location}/${partition}"
+      hdfs dfs -mkdir ${target_table_partition_location}
+      distributed_data_copy_and_overwrite ${source_table_partition_location} ${target_table_partition_location}
+
+      local_target_volume=$(record_table_volume "${target_table_partition_location}")
+      echo "target: '${target_table_partition_location}', volume: '${local_target_volume}'"
+
+      ((i++))
+    fi
+    if [[ $line == WARN:* && $i == 1 ]]
+    then
+      echo "line: $line, i: $i"
+      local_source_volume=$(record_table_volume "${source_table_location}")
+      echo "source: '${source_table_location}', volume: '${local_source_volume}'"
+
+      distributed_data_copy ${source_table_location} ${target_table_location}
+      local_target_volume=$(record_table_volume "${target_table_location}")
+      echo "target: '${target_table_location}', volume: '${local_target_volume}'"
+      ((i++))
+    fi
+  done < "$partition_list"
+  record_sync_date
+  do_repair_partition
+else
+  echo "Not supported migration type."
+fi

@@ -1,0 +1,84 @@
+#!/bin/bash
+
+# prd_hdfs_location='hdfs://yumcluster/apps/hive/warehouse/dw/kfc/fact_user_family_agg_monthly/*'
+# bak_hdfs_location='hdfs://yumcluster/user/cdp/pre_prd_dw_kfc.db/fact_user_family_agg_monthly/*'
+
+EXEC_DIR=$(dirname $0)
+
+if [ ! $# -eq 4 ]
+  then
+    echo "Arguments supplied not accurate: [source_db_name, source_table_name, target_db_name, target_table_name]"
+    exit 1
+else
+  source_db_name=$1
+  source_table_name=$2
+  target_db_name=$3
+  target_table_name=$4
+  echo "source db name: ${source_db_name}"
+  echo "source table name: ${source_table_name}"
+  echo "target db name: ${target_db_name}"
+  echo "target table name: ${target_table_name}"
+fi
+
+mr_job_queue_name='root.cdp.adhoc-ph-rsc'
+
+# $1: db_name, $2: table_name, $3: table_desc
+function retrieve_table_location {
+  # Retrieve source table location.
+  hive -e "show create table $1.$2" > ${EXEC_DIR}/"$3"_table_ddl.info
+  # The last grep 'hdfs' used to clean up other location lines which used as value recording.
+  table_location=`cat "${EXEC_DIR}"/"$3"_table_ddl.info | grep '\bhdfsw*\b' | awk -F "'" '{print $2}' | grep 'hdfs'`
+  echo ${table_location}
+}
+
+function do_repair_partition {
+  hive -e "msck repair table ${target_db_name}.${target_table_name}"
+}
+
+# Retrieve source table location.
+source_table_location=$(retrieve_table_location ${source_db_name} ${source_table_name} 'source')
+echo "source_table_location: ${source_table_location}"
+# Retrieve target table location.
+target_table_location=$(retrieve_table_location ${target_db_name} ${target_table_name} 'target')
+echo "target_table_location: ${target_table_location}"
+
+# $1: source table location, $2: target table location.
+function distributed_data_copy_and_overwrite {
+  # hadoop distcp -overwrite -Dmapreduce.job.queuename=${mr_job_queue_name} -update -delete $1/* $2
+  hadoop distcp -Dmapreduce.job.queuename=${mr_job_queue_name} -update -delete -m 20 $1 $2
+  hdfs dfs -chmod -R 777 $2
+}
+
+declare -A bak_partition_volume_map
+# for partition_volume in `hdfs dfs -du -s hdfs://yumcluster/apps/hive/warehouse/int/kfc/tld_detail/* | awk -F' ' '{print $1,$3}' | awk -F'/' '{print $NF, $1}'`;
+for partition_volume in `hdfs dfs -du -s "${target_table_location}/*" | awk -F' ' '{concat_var=$1"-"$3; print concat_var}' | awk -F'/' '{concat_var=$1$NF; print concat_var}'`;
+# 2305817391-hdfs:p_biz_date=20211130
+do
+  partition=`echo ${partition_volume} | cut -d'-' -f 2`
+  volume=`echo ${partition_volume} | cut -d'-' -f 1`
+  bak_partition_volume_map[${partition}]=${volume};
+  echo "${partition}:${bak_partition_volume_map[$partition]}" 
+  # echo "${partition_volume}: ${prd_partition_volume_map[$partition_volume]}"
+done
+
+for partition_volume in `hdfs dfs -du -s "${source_table_location}/*" | awk -F' ' '{concat_var=$1"-"$3; print concat_var}' | awk -F'/' '{concat_var=$1$NF; print concat_var}'`;
+do
+  partition=`echo ${partition_volume} | cut -d'-' -f 2`
+  volume=`echo ${partition_volume} | cut -d'-' -f 1`
+  if [[ ! ${bak_partition_volume_map[$partition]} == $volume ]];
+  then
+    partition_in_format=`echo ${partition} | cut -d':' -f 2`
+    if [[ ${partition_in_format} == ".hive" ]];
+    then
+      continue
+    fi
+    echo "failed: partition: ${partition_in_format}"
+    echo "partition volume of BAK: ${bak_partition_volume_map[$partition]}"
+    echo "partition volume of PRD: ${volume}"
+    source_table_partition_location="${source_table_location}/${partition_in_format}"
+    echo "source table partition location: ${source_table_partition_location}"
+    target_table_partition_location="${target_table_location}/${partition_in_format}"
+    echo "target table partition location: ${target_table_partition_location}"
+    distributed_data_copy_and_overwrite ${source_table_partition_location} ${target_table_partition_location}
+  fi
+done

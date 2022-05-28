@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Absolute path to this script, e.g. /home/user/bin/foo.sh
+SCRIPT=$(readlink -f "$0")
+# Absolute path this script is in, thus /home/user/bin
+EXEC_DIR=$(dirname "$SCRIPT")
+echo "EXEC_DIR: $EXEC_DIR"
+
+find ${EXEC_DIR}/ -name "validator*$(date -I).result" -exec cat '{}' + > {{ data_disk }}/{{ migration_type }}/{{ migration_type}}_agg_validator.csv
+
+python3 ${EXEC_DIR}/send_mail.py
